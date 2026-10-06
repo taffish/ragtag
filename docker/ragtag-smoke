@@ -1,0 +1,174 @@
+#!/usr/bin/python3
+"""每个模式独立离线运行；所有 fixture/索引/日志写入唯一 scratch。"""
+import importlib.metadata
+import os
+from pathlib import Path
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+mode = sys.argv[1] if len(sys.argv) == 2 else ''
+stage = 'init'
+logs = []
+
+def run(name, argv, expected=0, contains=None, output=None):
+    global stage
+    stage = name
+    r = subprocess.run(argv, text=True, errors='replace', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    log = Path(name + '.log')
+    log.write_text(r.stdout + r.stderr)
+    logs.append(log)
+    if output:
+        Path(output).write_text(r.stdout)
+    if expected is None:
+        assert r.returncode != 0, (name, 'unexpected success')
+    elif r.returncode != expected:
+        raise subprocess.CalledProcessError(r.returncode, argv)
+    if contains:
+        assert contains in r.stdout + r.stderr, (name, contains)
+    return r.stdout + r.stderr
+
+def fixture():
+    r = random.Random(7)
+    seq = ''.join(r.choice('ACGT') for _ in range(30000))
+    Path('ref.fa').write_text('>ref\n' + seq + '\n')
+    Path('query.fa').write_text('>ctg1\n' + seq + '\n')
+    return seq
+
+def check_agp(prefix, kind, components):
+    agp = Path(prefix) / ('ragtag.' + kind + '.agp')
+    fasta = Path(prefix) / ('ragtag.' + kind + '.fasta')
+    assert agp.stat().st_size > 0 and fasta.stat().st_size > 0
+    run('agpcheck', ['ragtag.py', 'agpcheck', str(agp)], contains='complete with no errors')
+    run('asmstats', ['ragtag.py', 'asmstats', str(fasta)], contains='N50')
+    run('rebuild-fasta', ['ragtag.py', 'agp2fa', str(agp), components], output='rebuilt.fa')
+    import pysam
+    with pysam.FastaFile(str(fasta)) as actual, pysam.FastaFile('rebuilt.fa') as rebuilt:
+        assert actual.references == rebuilt.references
+        assert all(actual.fetch(n) == rebuilt.fetch(n) for n in actual.references)
+
+def main():
+    global stage
+    if mode == 'identity':
+        assert run('version', ['ragtag.py', '--version']).strip() == 'v2.1.1'
+        assert importlib.metadata.version('RagTag') == '2.1.1'
+        assert run('mm2-version', ['minimap2', '--version']).strip() == '2.31-r1302'
+        assert run('unimap-version', ['unimap', '--version']).strip() == '0.1-r41'
+        assert run('nucmer-version', ['nucmer', '-V']).strip() == '4.0.1'
+        run('samtools-version', ['samtools', '--version'], contains='samtools 1.16.1')
+        source = Path('/opt/ragtag/share/doc/ragtag/source.txt').read_text()
+        assert 'ef19fbd09b7431e97371f35c7523d02f9bbe4418ce3143abb611d2cef8a2b451' in source
+        for path in ['/opt/ragtag/share/licenses/ragtag/LICENSE', '/opt/minimap2/share/licenses/minimap2/LICENSE.txt',
+                     '/opt/unimap/share/licenses/unimap/LICENSE.txt', '/opt/mummer/share/licenses/mummer4/LICENSE.md']:
+            assert Path(path).stat().st_size > 100
+        import intervaltree, networkx, numpy, pysam, ragtag_utilities
+    elif mode == 'interface':
+        run('help', ['ragtag.py', '--help'], contains='Tools for fast and flexible genome assembly scaffolding')
+        for cmd in ['correct', 'scaffold', 'patch', 'merge', 'agp2fa', 'agpcheck', 'asmstats', 'splitasm', 'delta2paf', 'paf2delta', 'updategff']:
+            run('help-' + cmd, ['ragtag.py', cmd, '--help'], contains='usage:')
+        run('citation', ['ragtag.py', '--citation'], contains='10.1186/s13059-022-02823-7')
+        run('enzymes', ['ragtag_create_links.py', '--list-enzymes'], contains='GATC')
+    elif mode == 'linkage':
+        for cmd in ['minimap2', 'unimap', 'nucmer', 'delta-filter', 'show-coords', 'samtools']:
+            output = run('ldd-' + cmd, ['ldd', shutil.which(cmd)])
+            assert 'not found' not in output
+    elif mode == 'reverse-merge':
+        run('upstream-unit', ['python3', '/opt/ragtag/share/testdata/upstream-tests/test_contig_alignment.py'], contains='Ran 4 tests')
+    elif mode.startswith('scaffold-'):
+        aligner = mode.split('-', 1)[1]
+        fixture()
+        args = ['ragtag.py', 'scaffold', '-f', '1000', '-t', '1', '-u', '-o', 'out']
+        if aligner == 'nucmer':
+            args += ['--aligner', 'nucmer', '--nucmer-params', '--maxmatch -l 100 -c 500']
+        elif aligner == 'unimap':
+            args += ['--aligner', 'unimap']
+        elif aligner != 'minimap2':
+            raise ValueError('unknown aligner')
+        run('scaffold', [*args, 'ref.fa', 'query.fa'])
+        assert 'ctg1' in Path('out/ragtag.scaffold.agp').read_text()
+        check_agp('out', 'scaffold', 'query.fa')
+    elif mode == 'correct':
+        fixture()
+        run('correct', ['ragtag.py', 'correct', '-f', '1000', '-t', '1', '-o', 'out', 'ref.fa', 'query.fa'])
+        assert Path('out/ragtag.correct.fasta').stat().st_size > 30000
+        run('correct-agp', ['ragtag.py', 'agpcheck', 'out/ragtag.correct.agp'], contains='complete with no errors')
+    elif mode == 'patch':
+        seq = fixture()
+        Path('target.fa').write_text('>target\n' + seq[:14000] + 'N'*100 + seq[16000:] + '\n')
+        run('patch', ['ragtag.py', 'patch', '-f', '1000', '-t', '1', '-u', '-o', 'out', 'target.fa', 'query.fa'])
+        check_agp('out', 'patch', 'out/ragtag.patch.comps.fasta')
+    elif mode == 'merge':
+        fixture()
+        for name in ['a.agp', 'b.agp']:
+            Path(name).write_text('##agp-version 2.1\nscaffold\t1\t30000\t1\tW\tctg1\t1\t30000\t+\n')
+        run('merge', ['ragtag.py', 'merge', '-l', '0', '-u', '-o', 'out', 'query.fa', 'a.agp', 'b.agp'])
+        check_agp('out', 'merge', 'query.fa')
+    elif mode == 'utilities':
+        seq = fixture()
+        run('nucmer', ['nucmer', '--maxmatch', '-l', '100', '-c', '500', '-p', 'aln', 'ref.fa', 'query.fa'])
+        run('delta2paf', ['ragtag.py', 'delta2paf', 'aln.delta'], output='aln.paf')
+        assert Path('aln.paf').stat().st_size > 0
+        run('paf2delta', ['ragtag.py', 'paf2delta', 'aln.paf'], output='roundtrip.delta')
+        run('coords', ['show-coords', '-TH', 'roundtrip.delta'], contains='ctg1')
+        Path('split.fa').write_text('>gap\n' + seq[:1000] + 'N'*100 + seq[1000:2000] + '\n')
+        run('split', ['ragtag.py', 'splitasm', '-o', 'split.agp', 'split.fa'], output='split-components.fa')
+        run('split-check', ['ragtag.py', 'agpcheck', 'split.agp'], contains='complete with no errors')
+        run('rename', ['ragtag_rename.py', '-p', 'seq', '-o', 'rename.agp', 'query.fa'], output='renamed.fa')
+        assert 'seq' in Path('renamed.fa').read_text()
+        Path('reverse.agp').write_text('##agp-version 2.1\nscaffold\t1\t30000\t1\tW\tctg1\t1\t30000\t-\n')
+        Path('genes.gff').write_text('##gff-version 3\nctg1\tsmoke\tgene\t101\t200\t.\t+\t.\tID=g1\n')
+        run('updategff', ['ragtag.py', 'updategff', 'genes.gff', 'reverse.agp'], output='updated.gff')
+        assert 'scaffold\tsmoke\tgene\t29801\t29900\t.\t-\t.\tID=g1' in Path('updated.gff').read_text()
+        # 可选 Hi-C 路径的真实 BAM 读取和连接计数，不依赖外部数据。
+        import pysam
+        Path('hic.fa').write_text('>a\n' + 'GATC'*250 + '\n>b\n' + 'GATC'*250 + '\n')
+        header = {'HD': {'VN': '1.6', 'SO': 'queryname'}, 'SQ': [{'SN': n, 'LN': 1000} for n in ['a', 'b']]}
+        with pysam.AlignmentFile('hic.bam', 'wb', header=header) as bam:
+            for ref, flag in [(0, 65), (1, 129)]:
+                read = pysam.AlignedSegment()
+                read.query_name = 'pair1'; read.query_sequence = 'A'*50
+                read.flag = flag; read.reference_id = ref; read.reference_start = 100
+                read.mapping_quality = 60; read.cigar = [(0, 50)]
+                read.next_reference_id = 1-ref; read.next_reference_start = 100
+                bam.write(read)
+        run('hic-links', ['ragtag_create_links.py', '-a', 'hic.fa', '-b', 'hic.bam', '-r', 'GATC'], output='links.tsv')
+        assert Path('links.tsv').read_text().startswith('a_b\tb_b\t')
+    elif mode == 'plot':
+        script = Path('/opt/mummer/bin/mummerplot').read_text()
+        assert 'kill 1, $child if defined($child) && $child > 1;' in script
+        assert "use filetest 'access';" in Path('/opt/mummer/lib/mummer/Foundation.pm').read_text()
+        fixture()
+        run('nucmer', ['nucmer', '--maxmatch', '-p', 'aln', 'ref.fa', 'query.fa'])
+        run('plot', ['mummerplot', '--png', '-p', 'dot', 'aln.delta'])
+        assert Path('dot.png').read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+    elif mode == 'errors':
+        run('unknown-command', ['ragtag.py', 'not-a-command'], expected=2, contains='unrecognized command')
+        run('missing-input', ['ragtag.py', 'scaffold', 'absent.fa', 'missing.fa'], expected=None, contains='Could not find')
+        assert not Path('ragtag_output/ragtag.scaffold.fasta').exists()
+        Path('bad.agp').write_text('not AGP\n')
+        run('bad-agp', ['ragtag.py', 'agpcheck', 'bad.agp'], expected=None)
+        # 全部 dispatcher 分支必须传播子进程原始退出码。
+        fake = Path('fake'); fake.mkdir()
+        os.environ['PATH'] = str(fake.resolve()) + ':' + os.environ['PATH']
+        for sub, script in [('correct','correct'),('scaffold','scaffold'),('patch','patch'),('merge','merge'),
+                            ('agp2fa','agp2fa'),('agpcheck','agpcheck'),('asmstats','asmstats'),('splitasm','splitasm'),
+                            ('delta2paf','delta2paf'),('paf2delta','paf2delta'),('updategff','update_gff')]:
+            f = fake / ('ragtag_' + script + '.py')
+            f.write_text('#!/bin/sh\necho injected-child37 >&2\nexit 37\n'); f.chmod(0o755)
+            run('child-' + sub, ['ragtag.py', sub], expected=37, contains='injected-child37')
+    else:
+        raise ValueError('unknown smoke mode: ' + mode)
+
+with tempfile.TemporaryDirectory(prefix='taf-ragtag-smoke-') as tmp:
+    os.chdir(tmp)
+    try:
+        main()
+    except Exception as exc:
+        code = exc.returncode if isinstance(exc, subprocess.CalledProcessError) else 1
+        print(f'ragtag-smoke: FAIL mode={mode} stage={stage} exit={code}: {exc}', file=sys.stderr)
+        for log in sorted(set(logs) | set(Path('.').glob('out/*.err')) | set(Path('.').glob('out/*.log'))):
+            print('--- ' + str(log) + ' ---\n' + '\n'.join(log.read_text(errors='replace').splitlines()[-25:]), file=sys.stderr)
+        sys.exit(code if code > 0 else 128-code)
+    print('ragtag-smoke: PASS ' + mode)

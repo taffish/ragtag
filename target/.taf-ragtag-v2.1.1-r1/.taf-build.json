@@ -1,0 +1,6 @@
+{
+  "artifact": "taf-ragtag-v2.1.1-r1",
+  "schema": "taffish.build/v1",
+  "source_sha256": "fbb2e230e701798d39e619e943f4a9a25dd92e67bde57b8ac647bf83fc058efe",
+  "wrapper_sha256": "0596f65b5d6f4891fc301c52814a90a001129c52d0713b26a630d425da9db424"
+}

@@ -1,6 +1,6 @@
-ARG RAGTAG_VERSION=2.1.0
-ARG RAGTAG_TAG=v2.1.0
-ARG RAGTAG_SHA256=b044b5e4305219ed1d9f05ffb9e7635e2ab61a4f72ab49660feede1a502aa419
+ARG RAGTAG_VERSION=2.1.1
+ARG RAGTAG_TAG=v2.1.1
+ARG RAGTAG_SHA256=ef19fbd09b7431e97371f35c7523d02f9bbe4418ce3143abb611d2cef8a2b451
 ARG MINIMAP2_VERSION=2.31
 ARG MINIMAP2_INTERNAL_VERSION=2.31-r1302
 ARG MINIMAP2_SHA256=c1351de6319c123369c2f4f37ba0ccf18c7ace47e2b1c0a35e30056b4a3bd9c9
@@ -14,7 +14,7 @@ ARG UNIMAP_SHA256=d5d7831e1fa78c943a96ef78ba22ec88eebf39368bdb135c30554f052f0dbc
 ARG UNIMAP_LICENSE_COMMIT=cb7ad7560cf56a354d3abb91fc1bdf75108f9380
 ARG UNIMAP_LICENSE_SHA256=ee3d43f5a37f90c3f85e7688c3e7e705777b3fd757f51adfefaf7ab0168b7518
 
-FROM debian:12-slim AS minimap2-builder
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS minimap2-builder
 
 ARG MINIMAP2_VERSION
 ARG MINIMAP2_INTERNAL_VERSION
@@ -59,7 +59,7 @@ RUN set -eux; \
     install -m 0644 LICENSE.txt /opt/minimap2/share/licenses/minimap2/LICENSE.txt; \
     /opt/minimap2/bin/minimap2 --version | grep -Fx "${MINIMAP2_INTERNAL_VERSION}" >/dev/null
 
-FROM debian:12-slim AS unimap-builder
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS unimap-builder
 
 ARG UNIMAP_VERSION
 ARG UNIMAP_INTERNAL_VERSION
@@ -108,7 +108,7 @@ RUN set -eux; \
     echo "${UNIMAP_LICENSE_SHA256}  /opt/unimap/share/licenses/unimap/LICENSE.txt" | sha256sum -c -; \
     /opt/unimap/bin/unimap --version | grep -Fx "${UNIMAP_INTERNAL_VERSION}" >/dev/null
 
-FROM debian:12-slim AS mummer-builder
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS mummer-builder
 
 ARG MUMMER_VERSION
 ARG MUMMER_SHA256
@@ -155,9 +155,15 @@ RUN set -eux; \
       "https://raw.githubusercontent.com/mummer4/mummer/v${MUMMER_VERSION}/COPYRIGHT" \
       -o /opt/mummer/share/licenses/mummer4/COPYRIGHT; \
     echo "${MUMMER_COPYRIGHT_SHA256}  /opt/mummer/share/licenses/mummer4/COPYRIGHT" | sha256sum -c -; \
-    /opt/mummer/bin/nucmer -V 2>&1 | grep -Fx "${MUMMER_VERSION}" >/dev/null
+    /opt/mummer/bin/nucmer -V 2>&1 | grep -Fx "${MUMMER_VERSION}" >/dev/null; \
+    rm -rf /opt/mummer/include /opt/mummer/lib/pkgconfig; \
+    find /opt/mummer/lib -type f \( -name '*.a' -o -name '*.la' \) -delete
 
-FROM debian:12-slim AS ragtag-src
+COPY docker/patch-mummer.pl /tmp/patch-mummer.pl
+RUN perl /tmp/patch-mummer.pl /opt/mummer \
+ && perl -c /opt/mummer/bin/mummerplot
+
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS ragtag-src
 
 ARG RAGTAG_TAG
 ARG RAGTAG_SHA256
@@ -175,9 +181,27 @@ RUN set -eux; \
       "https://github.com/malonge/RagTag/archive/refs/tags/${RAGTAG_TAG}.tar.gz" \
       -o ragtag.tar.gz; \
     echo "${RAGTAG_SHA256}  ragtag.tar.gz" | sha256sum -c -; \
-    tar -xzf ragtag.tar.gz --strip-components=1
+    tar -xzf ragtag.tar.gz --strip-components=1; \
+    rm ragtag.tar.gz
 
-FROM debian:12-slim
+FROM ragtag-src AS ragtag-builder
+
+ARG RAGTAG_TAG
+ARG RAGTAG_SHA256
+RUN apt-get -o Acquire::Retries=5 update \
+ && apt-get install -y --no-install-recommends python3-pip python3-setuptools python3-wheel \
+ && rm -rf /var/lib/apt/lists/*
+COPY docker/patch-dispatch.py /tmp/patch-dispatch.py
+RUN set -eux; \
+    mkdir -p /opt/ragtag/share/doc/ragtag /opt/ragtag/share/licenses/ragtag /opt/ragtag/share/testdata; \
+    cp README.md ragtag.py /opt/ragtag/share/doc/ragtag/; \
+    cp LICENSE /opt/ragtag/share/licenses/ragtag/; \
+    cp -R tests /opt/ragtag/share/testdata/upstream-tests; \
+    python3 /tmp/patch-dispatch.py ragtag.py; \
+    python3 -m pip install --no-cache-dir --no-build-isolation --no-deps --root /opt/ragtag-install .; \
+    printf 'Tag: %s\nSHA256: %s\nPatch: child exit status and unknown-command failure only\n' "$RAGTAG_TAG" "$RAGTAG_SHA256" > /opt/ragtag/share/doc/ragtag/source.txt
+
+FROM debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 ARG RAGTAG_VERSION
 ARG MINIMAP2_INTERNAL_VERSION
@@ -195,6 +219,7 @@ RUN set -eux; \
             file \
             findutils \
             gawk \
+            gnuplot-nox \
             grep \
             gzip \
             libgomp1 \
@@ -204,10 +229,7 @@ RUN set -eux; \
             python3-intervaltree \
             python3-networkx \
             python3-numpy \
-            python3-pip \
             python3-pysam \
-            python3-setuptools \
-            python3-wheel \
             samtools \
             sed \
             tabix \
@@ -223,18 +245,15 @@ RUN set -eux; \
 COPY --from=minimap2-builder /opt/minimap2 /opt/minimap2
 COPY --from=unimap-builder /opt/unimap /opt/unimap
 COPY --from=mummer-builder /opt/mummer /opt/mummer
-COPY --from=ragtag-src /tmp/ragtag-src /tmp/ragtag-src
+COPY --from=ragtag-builder /opt/ragtag-install/usr/local /usr/local
+COPY --from=ragtag-builder /opt/ragtag /opt/ragtag
+COPY docker/ragtag-smoke /usr/local/bin/ragtag-smoke
 
 ENV PATH=/opt/minimap2/bin:/opt/unimap/bin:/opt/mummer/bin:/opt/mummer/libexec/mummer:${PATH}
 ENV LD_LIBRARY_PATH=/opt/mummer/lib
 
 RUN set -eux; \
-    python3 -m pip install --no-cache-dir --break-system-packages --no-deps /tmp/ragtag-src; \
-    mkdir -p /opt/ragtag/share/doc/ragtag /opt/ragtag/share/licenses/ragtag /opt/ragtag/share/testdata; \
-    cp /tmp/ragtag-src/README.md /opt/ragtag/share/doc/ragtag/; \
-    cp /tmp/ragtag-src/LICENSE /opt/ragtag/share/licenses/ragtag/LICENSE; \
-    cp -R /tmp/ragtag-src/tests /opt/ragtag/share/testdata/upstream-tests; \
-    rm -rf /tmp/ragtag-src; \
+    chmod 0755 /usr/local/bin/ragtag-smoke; \
     for cmd in /opt/mummer/bin/* /opt/mummer/libexec/mummer/* /opt/minimap2/bin/* /opt/unimap/bin/*; do \
         if [ -x "$cmd" ] && [ ! -e "/usr/local/bin/$(basename "$cmd")" ]; then \
             ln -s "$cmd" "/usr/local/bin/$(basename "$cmd")"; \
@@ -243,6 +262,7 @@ RUN set -eux; \
 
 ENV TAFFISH_ENV=TAFFISH
 ENV TAFFISH_NAME=ragtag
+ENV PYTHONDONTWRITEBYTECODE=1
 
 RUN set -eux; \
     for cmd in ragtag.py ragtag_correct.py ragtag_scaffold.py ragtag_patch.py ragtag_merge.py ragtag_agp2fa.py ragtag_agpcheck.py ragtag_asmstats.py ragtag_delta2paf.py ragtag_paf2delta.py ragtag_splitasm.py ragtag_update_gff.py ragtag_rename.py ragtag_stats.py minimap2 unimap nucmer delta-filter show-coords samtools python3 bash; do \
@@ -279,10 +299,6 @@ RUN set -eux; \
     grep -F "complete with no errors" agpcheck.txt >/dev/null; \
     ragtag.py asmstats mm2/ragtag.scaffold.fasta > asmstats.tsv; \
     grep -F "N50" asmstats.tsv >/dev/null; \
-    ragtag.py scaffold --aligner nucmer --nucmer-params "--maxmatch -l 100 -c 500" -f 1000 -o nucmer ref.fa query.fa > nucmer.log 2>&1 || { cat nucmer.log >&2; exit 1; }; \
-    test -s nucmer/ragtag.scaffold.agp; \
-    unimap -b24 -c ref.fa query.fa > unimap.paf 2> unimap.log || { cat unimap.log >&2; exit 1; }; \
-    test -s unimap.paf; \
     cd /; \
     rm -rf "$tmp"; \
     find /opt/minimap2 /opt/unimap /opt/mummer -type f -perm /111 -exec sh -c 'for f do if file "$f" | grep -q "ELF"; then ldd "$f"; fi; done' sh {} + > /tmp/ragtag-ldd.txt; \
@@ -290,4 +306,4 @@ RUN set -eux; \
     if grep -F "not found" /tmp/ragtag-ldd.txt; then exit 1; fi; \
     rm -f /tmp/ragtag-ldd.txt
 
-WORKDIR /root
+WORKDIR /work
